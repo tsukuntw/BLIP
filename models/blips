@@ -1,0 +1,1007 @@
+'''
+ * Copyright (c) 2022, salesforce.com, inc.
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ * For full license text, see LICENSE.txt file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+ * By Junnan Li
+'''
+import warnings
+warnings.filterwarnings("ignore")
+
+from models.vit import VisionTransformer, interpolate_pos_embed, Block
+from models.med import BertConfig, BertModel, BertLMHeadModel
+from transformers import BertTokenizer
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+import os
+from urllib.parse import urlparse
+from timm.models.hub import download_cached_file
+from .swin_transformer_necks import SwinTransformerNeck
+from .swin_transformer_scale import SwinTransformerScale
+
+from mmengine.model.weight_init import (constant_init, trunc_normal_,
+                                        trunc_normal_init)
+ 
+from collections import OrderedDict
+# from transformers import ViTConfig, ViTModel, BaseModelOutputWithPooling
+from functools import partial
+import numpy as np
+#
+import math
+from mmcv.cnn import ConvModule
+from models.backbones.swin import SwinTransformer
+
+# 1028 mplug
+# from models.predictor import TextGenerator
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+        
+class PositionalEmbedding2D(nn.Module):
+# https://github.com/codertimo/BERT-pytorch/blob/master/bert_pytorch/model/embedding/position.py
+# ziji xiugai de
+    def __init__(self, d_model, tokens_shape = (4, 4), tokens_size = (6, 6), max_len=24):
+        super().__init__()
+
+        # Compute the positional encodings once in log space.
+        d_model = int(d_model/2) # 384
+        pe = torch.zeros(max_len, 2, d_model).float()
+        pe.require_grad = False
+
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()
+
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        
+        pe[:, 1, 0::2] = torch.sin(position * div_term)
+        pe[:, 1, 1::2] = torch.cos(position * div_term)
+        
+        self.tokens_shape = tokens_shape
+        pos2d = torch.zeros(max_len, max_len, d_model*2).float()
+        pos2d.require_grad = False
+        
+        for i in range(max_len):
+            for j in range(max_len):
+                pos2d[i,j,:] = torch.cat((pe[i, 0, :], pe[j, 1, :]), dim = -1)
+
+        # pos2d = pos2d.unsqueeze(0)
+        self.register_buffer('pos2d', pos2d.unsqueeze(0)) # 1, 24, 24, 768
+        # print('pos2d {}'.format(pos2d.shape))
+        
+        pos2d_scale = torch.stack([pos2d[2*i:2*i+tokens_shape[0], 2*j:2*j+tokens_shape[1], :] for i in range(tokens_size[0]) for j in range(tokens_size[1])], dim = -1)
+        pos2d_scale = pos2d_scale.permute(2, 0, 1, 3).contiguous().unsqueeze(0) # 1, 4, 4, 768, 36 to 1,, 768 4, 4, 36
+        self.register_buffer('pos2d_scale', pos2d_scale) 
+
+    def forward(self, x):
+        return self.pos2d
+
+class BLIP_Base(nn.Module):
+    def __init__(self,                 
+                 med_config = 'configs/med_config.json',  
+                 image_size = 224,
+                 vit = 'base',
+                 vit_grad_ckpt = False,
+                 vit_ckpt_layer = 0,  
+                 use_swin = False,
+                 use_contrastive = False,
+                 more_output = True, 
+                 use_vit_layers = 1.0,          
+                 ):
+        """
+        Args:
+            med_config (str): path for the mixture of encoder-decoder model's configuration file
+            image_size (int): input image size
+            vit (str): model size of vision transformer
+        """               
+        super().__init__()
+        
+        #
+        self.use_swin = use_swin
+        
+        if self.use_swin:
+            # 0910
+            assert vit in ['scale', 'local', 'base'], "mode parameter must be scale, local, or base"
+            self.visual_encoder = Create_Vit_Scale(vit,image_size, vit_grad_ckpt, vit_ckpt_layer, 
+                                             remain_depth_ratio = use_vit_layers, more_output = more_output)
+            vision_width = self.visual_encoder.vision_width
+        else:
+            self.visual_encoder, vision_width = create_vit(vit,image_size, vit_grad_ckpt, vit_ckpt_layer)
+        
+        self.tokenizer = init_tokenizer()   
+        med_config = BertConfig.from_json_file(med_config)
+        med_config.encoder_width = vision_width
+        self.text_encoder = BertModel(config=med_config, add_pooling_layer=False)  
+        
+        # 
+        self.text_decoder = BertLMHeadModel(config=med_config)
+        text_width = self.text_decoder.config.hidden_size
+
+        
+    def forward(self, image, caption, mode):
+        
+        assert mode in ['image', 'text', 'multimodal'], "mode parameter must be image, text, or multimodal"
+        text = self.tokenizer(caption, return_tensors="pt").to(image.device) 
+        
+        if mode=='image':    
+            # return image features
+            image_embeds = self.visual_encoder(image)   
+            if not self.use_swin:          
+                return image_embeds
+            else:
+                return image_embeds[:,1:17,:], image_embeds[:,17:,:], 
+        
+        elif mode=='text':
+            # return text features
+            text_output = self.text_encoder(text.input_ids, attention_mask = text.attention_mask,                      
+                                            return_dict = True, mode = 'text')  
+            return text_output.last_hidden_state
+        
+        elif mode=='multimodal':
+            # from decoder
+            image_embeds = self.visual_encoder(image)
+            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
+            
+            text = self.tokenizer(caption, padding='longest', truncation=True, max_length=40, return_tensors="pt").to(image.device) 
+            
+            print('text.input_ids {}'.format(text.input_ids))
+            
+            text.input_ids[:,0] = self.tokenizer.enc_token_id
+            
+            print('text.input_ids {}'.format(text.input_ids))
+            
+            decoder_targets = text.input_ids.masked_fill(text.input_ids == self.tokenizer.pad_token_id, -100)         
+            decoder_targets[:,:1] = -100
+         
+            decoder_output = self.text_decoder(text.input_ids, 
+                                               attention_mask = text.attention_mask, 
+                                               encoder_hidden_states = image_embeds, # image_embeds
+                                               encoder_attention_mask = image_atts,
+                                               output_hidden_states = True,
+                                               labels = decoder_targets,
+                                               return_dict = True,   
+                                              ) 
+            return decoder_output.hidden_states
+        
+        
+            # blip baseline
+            # return multimodel features
+            # image_embeds = self.visual_encoder(image)    
+            # image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)      
+            
+            # text.input_ids[:,0] = self.tokenizer.enc_token_id
+            # output = self.text_encoder(text.input_ids,
+            #                            attention_mask = text.attention_mask,
+            #                            encoder_hidden_states = image_embeds,
+            #                            encoder_attention_mask = image_atts,      
+            #                            return_dict = True,
+            #                           )              
+            # return output.last_hidden_state
+        
+        
+        
+class BLIP_Decoder(nn.Module):
+    def __init__(self,                 
+                 med_config = 'configs/med_config.json',  
+                 image_size = 384,
+                 vit = 'base',
+                 vit_grad_ckpt = False,
+                 vit_ckpt_layer = 0,
+                 prompt = 'a picture of ',
+                 use_swin = False,
+                 use_contrastive = False,
+                 more_output = True,
+                 proj_dim = 256,
+                 use_vit_layers = 1.0,
+                 scst=False,
+                 scst_config=False,
+                 ):
+        """
+        Args:
+            med_config (str): path for the mixture of encoder-decoder model's configuration file
+            image_size (int): input image size
+            vit (str): model size of vision transformer
+        """            
+        super().__init__()
+        # self.visual_encoder, vision_width = create_vit(vit,image_size, vit_grad_ckpt, vit_ckpt_layer,)
+        
+        #
+        self.use_swin = use_swin
+        self.use_contrastive = use_contrastive
+        self.image_size = image_size
+        if self.use_swin:
+            # 0910
+            self.visual_encoder = Create_Vit_Scale(vit,image_size, vit_grad_ckpt, vit_ckpt_layer,
+                                             remain_depth_ratio = use_vit_layers, more_output = more_output)
+            vision_width = self.visual_encoder.vision_width
+        self.more_output = more_output
+        
+        self.tokenizer = init_tokenizer()   
+        med_config = BertConfig.from_json_file(med_config)
+        med_config.encoder_width = vision_width
+        self.text_decoder = BertLMHeadModel(config=med_config)
+        text_width = self.text_decoder.config.hidden_size
+        
+        #
+        # self.img_projection_out = nn.Linear(vision_width//8, vision_width)
+        # if self.use_contrastive:
+        #     # two
+        #     self.img_projection_head = nn.ModuleList()
+        #     self.img_projection_head.append(nn.Linear(vision_width, proj_dim)) 
+        #     self.img_projection_head.append(nn.Linear(vision_width//8, proj_dim)) # 96,256
+        #     self.txt_projection_head = nn.Linear(text_width, proj_dim)
+        # if self.more_output:
+        #     self.img_projection_head = nn.ModuleList()
+        #     for i in range(4):
+        #         # 0910
+        #         self.img_projection_head.append(nn.Linear(vision_width//2**i, vision_width)) # 768,384,192,96
+                
+            # self.img_projection_head.append(nn.Identity())
+            # self.learnable_w.append(Mlp(vision_width, hidden_features=vision_width*4, out_features = vision_width))
+        
+        self.prompt = prompt
+        self.prompt_length = len(self.tokenizer(self.prompt).input_ids)-1
+        
+        # 1028 scst
+        # if scst_config:
+        #     self.beam_generator = TextGenerator(scst_config, self.text_decoder, tokenizer=self.tokenizer)
+
+        
+    def forward(self, image, caption, is_train=True, out_size=5, scst=False, do_sample=False):
+        # 1028 scst
+        # if scst:
+        #     return self.beam_search(image, is_train=True, out_size=out_size, do_sample=do_sample)
+        
+        image_embeds = self.visual_encoder(image)
+        # B, _, C = image_embeds[0].shape
+        
+        # for more output the channel is the same with 768
+        # cls_token = image_embeds[0][:,0,:].view(B,-1, C)
+        
+        # 0919
+        # image_embeds_outs = []
+        # for i in range(4):
+        #     image_embeds_outs.append(self.img_projection_head[i](image_embeds[i][:,1:,:]))
+        # image_embeds_outs.append(image_embeds[-1]) # append 768
+        # image_embeds_outs = image_embeds_outs[::-1] # reverse 768 96 192 384 768
+          
+          
+          
+        # for i in range(len(self.learnable_w)):
+        #     # print('image_embeds_outs {} {}'.format(i,image_embeds_outs[i].shape))
+        #     image_embeds_scales.append(self.learnable_w[i](image_embeds_outs[i]))
+            
+        # image_embeds_scale = torch.cat(image_embeds_outs[-1:] + image_embeds_outs[:-1], dim=1)
+        
+        # 0919
+        # image_embeds = torch.cat(image_embeds_outs, dim=1)
+        
+        
+        # image_embeds = torch.cat((image_embeds[-1], image_embeds_scale), dim=1)
+            
+            
+        # image_embeds_out = torch.cat((cls_token, self.img_projection_out(image_embeds[-1][:,1:,:])), dim=1) 
+        # print(image_embeds_out.shape)
+        #
+        image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
+        
+        # 1028 scst
+        # if not is_train:
+        #     topk_ids, topk_probs = self.generation(image_embeds, image_atts) 
+        #     return topk_ids, topk_probs
+        
+        text = self.tokenizer(caption, padding='longest', truncation=True, max_length=40, return_tensors="pt").to(image.device) 
+        
+        text.input_ids[:,0] = self.tokenizer.bos_token_id
+        
+        decoder_targets = text.input_ids.masked_fill(text.input_ids == self.tokenizer.pad_token_id, -100)         
+        decoder_targets[:,:self.prompt_length] = -100
+     
+        decoder_output = self.text_decoder(text.input_ids, 
+                                           attention_mask = text.attention_mask, 
+                                           encoder_hidden_states = image_embeds, # image_embeds
+                                           encoder_attention_mask = image_atts,
+                                           output_hidden_states = True,
+                                           labels = decoder_targets,
+                                           return_dict = True,   
+                                          )   
+        loss_lm = decoder_output.loss
+        
+        # 
+        # if self.use_contrastive:
+        #     loss_clr0, loss_clr1 = self.contrastive_loss(image_embeds, decoder_output.hidden_states[-1])
+        #     return (loss_lm, loss_clr0, loss_clr1,)
+        
+        return loss_lm
+    
+    # flip contrastive loss
+    def compute_contrastive_loss(self, z0, z1):
+        
+        scale = 1 / 0.01
+        
+        logits = torch.einsum("nc,mc->nm", z0, z1)
+        # logging.info("logits.shape: {}".format(logits.shape))
+        logits *= scale
+        # ---------------------------------------------------------------------------
+        logits_pos = torch.einsum(
+            "nc,nc->n", z0, z1
+        )  # easier to take the diagonal (positive)
+        logits_pos *= scale
+
+        # hand-written log_softmax
+        # we do not need to shift x_max as it is well-bound after l2-normalization
+        exp_logits = torch.exp(logits)
+        logsumexp_logits01 = torch.log(torch.sum(exp_logits, axis=-1))  # [N,]
+        logsumexp_logits10 = torch.log(torch.sum(exp_logits, axis=0))  # [N,]
+
+        loss01 = -(logits_pos - logsumexp_logits01)  # [N,]
+        loss10 = -(logits_pos - logsumexp_logits10)  # [N,]
+
+        loss01 = loss01.mean()
+        loss10 = loss10.mean()
+
+        loss = (loss01 + loss10) / 2
+        return loss
+    
+    # contrastive_loss for pairs use first and mean
+    def contrastive_loss(self, x_img, x_txt):
+        # apply contrastive learning for single output
+        if not self.more_output:
+            # B, _, C = x_img[0].shape # torch.rand(1, 196, 768)
+            # print('x_img {}'.format(x_img[0].shape))
+            z_img0 = x_img[0][:, 0, :] 
+            z_img1 = x_img[-1][:, 1:, :].mean(axis=1) # torch.rand(1, 196, 768)
+            z_img0 = F.normalize(self.img_projection_head[0](z_img0), dim=-1) 
+            z_img1 = F.normalize(self.img_projection_head[-1](z_img1), dim=-1)
+
+            # z_img0 /= jnp.linalg.norm(z_img0, axis=-1, keepdims=True) + 1e-8
+            # z_img1 /= jnp.linalg.norm(z_img1, axis=-1, keepdims=True) + 1e-8
+            
+            z_txt = x_txt[:, 0, :]
+            z_txt = F.normalize(self.txt_projection_head(z_txt), dim=-1)
+            
+            
+            # z_txt /= jnp.linalg.norm(z_txt, axis=-1, keepdims=True) + 1e-8
+
+            # print('img shape {}'.format(z_img0.shape))
+            # print('txt shape {}'.format(z_txt.shape))
+            
+            loss_clr0 = self.compute_contrastive_loss(z_img0, z_txt)
+            loss_clr1 = self.compute_contrastive_loss(z_img1, z_txt)
+        else:
+            assert isinstance(x_img, (list, tuple))
+            z_img0 = x_img[0][:, 0, :]
+            z_img1 = [x_img[i][:, 1:, :].mean(axis=1) for i in range(len(x_img))]
+            z_img0 = F.normalize(self.img_projection_head[0](z_img0), dim=-1)
+            z_img1 = [F.normalize(self.img_projection_head[i](z_img1[i]), dim=-1) for i in range(len(z_img1))]
+                                                                                                 
+            z_txt = x_txt[:, 0, :]
+            z_txt = F.normalize(self.txt_projection_head(z_txt), dim=-1)                                                                                     
+            loss_clr0 = self.compute_contrastive_loss(z_img0, z_txt)
+            loss_clr1 = torch.stack([self.compute_contrastive_loss(z_img1[i], z_txt) for i in range(len(z_img1))])
+            loss_clr1 = torch.sum(loss_clr1)
+            
+
+        return loss_clr0, loss_clr1
+        
+    def generate(self, image, sample=False, num_beams=3, max_length=30, min_length=10, top_p=0.9, repetition_penalty=1.0, scst=False):
+        image_embeds = self.visual_encoder(image)
+        
+        #
+        # cls_token = image_embeds[0][:,0,:].view(image_embeds[0].shape[0], -1, image_embeds[0].shape[-1])
+        
+        
+        # 0919
+        # image_embeds_outs = []
+        # for i in range(4):
+        #     image_embeds_outs.append(self.img_projection_head[i](image_embeds[i][:,1:,:]))
+        # image_embeds = torch.cat(image_embeds_outs, dim=1)
+        
+        
+        
+        # image_embeds_outs.append(image_embeds[-1]) # append 768
+        # image_embeds_outs = image_embeds_outs[::-1] # reverse 768 96 192 384 768
+        
+        
+        # for i in range(len(self.learnable_w)):
+        #     # print('image_embeds_outs {} {}'.format(i,image_embeds_outs[i].shape))
+        #     image_embeds_scales.append(self.learnable_w[i](image_embeds_outs[i]))
+        
+        
+        # image_embeds = torch.cat((image_embeds[-1], image_embeds_scale), dim=1)
+        # image_embeds = torch.cat((cls_token, image_embeds[-1][:,1:,:]), dim=1)
+
+        if not sample:
+            image_embeds = image_embeds.repeat_interleave(num_beams,dim=0)
+            
+        image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
+        model_kwargs = {"encoder_hidden_states": image_embeds, "encoder_attention_mask":image_atts}
+        
+        prompt = [self.prompt] * image.size(0)
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(image.device) 
+        input_ids[:,0] = self.tokenizer.bos_token_id
+        input_ids = input_ids[:, :-1] 
+
+        if sample:
+            #nucleus sampling
+            outputs = self.text_decoder.generate(input_ids=input_ids,
+                                                  max_length=max_length,
+                                                  min_length=min_length,
+                                                  do_sample=True,
+                                                  top_p=top_p,
+                                                  num_return_sequences=1,
+                                                  eos_token_id=self.tokenizer.sep_token_id,
+                                                  pad_token_id=self.tokenizer.pad_token_id, 
+                                                  repetition_penalty=1.1,                                            
+                                                  **model_kwargs)
+        else:
+            #beam search
+            outputs = self.text_decoder.generate(input_ids=input_ids,
+                                                  max_length=max_length,
+                                                  min_length=min_length,
+                                                  num_beams=num_beams,
+                                                  eos_token_id=self.tokenizer.sep_token_id,
+                                                  pad_token_id=self.tokenizer.pad_token_id,     
+                                                  repetition_penalty=repetition_penalty,
+                                                  **model_kwargs)
+                                                  
+        # if scst:
+        #     return outputs            
+            
+        captions = []    
+        for output in outputs:
+            caption = self.tokenizer.decode(output, skip_special_tokens=True)    
+            captions.append(caption[len(self.prompt):])
+        return captions
+    
+    # 1028 scst
+    def beam_search(self, image, is_train=True, out_size=5, do_sample=False):
+        image_embeds = self.visual_encoder(image)
+        # if self.large:
+        #     image_embeds = self.dropout(self.visn_layer_norm(self.visn_fc(image_embeds)))
+        image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
+        topk_ids, topk_probs = self.generation(image_embeds, image_atts, out_size=out_size, do_sample=do_sample) 
+
+        return topk_ids, topk_probs
+    # 1028 scst    
+    def generation(self, question_states, question_atts, out_size=1, do_sample = False):
+        encoder_inputs = [question_states, question_atts]
+        topk_ids,topk_probs = self.beam_generator.translate_batch_scst(encoder_inputs,do_sample=do_sample,out_size=out_size)  
+        return topk_ids, topk_probs
+        
+        
+
+def blip_decoder(pretrained='',**kwargs):
+    model = BLIP_Decoder(**kwargs)
+    if pretrained:
+        model,msg = load_checkpoint(model,pretrained)
+        print('missing keys: {}'.format(msg.missing_keys))
+        # assert(len(msg.missing_keys)==0)
+    return model    
+    
+def blip_feature_extractor(pretrained='', scale_pretrained = '',**kwargs):
+    model = BLIP_Base(**kwargs)
+    if pretrained:
+        model,msg = load_checkpoint(model,pretrained)
+        print('missing keys: {}'.format(len(msg.missing_keys)))
+        # assert(len(msg.missing_keys)==0)
+    return model        
+
+def init_tokenizer():
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    tokenizer.add_special_tokens({'bos_token':'[DEC]'})
+    tokenizer.add_special_tokens({'additional_special_tokens':['[ENC]']})       
+    tokenizer.enc_token_id = tokenizer.additional_special_tokens_ids[0]  
+    return tokenizer
+
+class Create_Vit(nn.Module):
+    def __init__(self,vit, image_size, use_grad_checkpointing=False, ckpt_layer=0, drop_path_rate=0, 
+                 remain_depth_ratio = 1.0, more_output = False):
+        super(Create_Vit, self).__init__()
+        assert vit in ['base', 'large'], "vit parameter must be base or large"
+        # 
+        self.image_size = image_size
+        self.more_output = more_output
+        if vit=='base':
+            vision_width = 768
+            visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=int(12*remain_depth_ratio), 
+                                               num_heads=12, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                               drop_path_rate=0 or drop_path_rate
+                                              )
+            
+            #
+            # https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/vit/configuration_vit.py
+            # if use_fpn:
+            #     vision_width = 768
+            #     configuration = ViTConfig(image_size = image_size, patch_size=16, hidden_size=vision_width, 
+            #                               num_attention_heads=12, num_hidden_layersint(12*remain_depth_ratio), 
+            #                               layer_norm_eps=1e-6, intermediate_size=vision_width*4, hidden_dropout_prob=0 or drop_path_rate)
+            #     visual_encoder = ViTModel(configuration)
+
+        elif vit=='large':
+            vision_width = 1024
+            visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=int(24*remain_depth_ratio), 
+                                               num_heads=16, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                               drop_path_rate=0.1 or drop_path_rate
+                                              )
+        self.vision_width = vision_width
+        self.visual_encoder = visual_encoder
+        feat_channel = self.vision_width//8 
+        self.swintransformer = SwinTransformerNeck(
+                in_channel=feat_channel ,
+                use_swin = True,
+                use_swin_mergecat = True,
+                depths=(2, 2, 2, 2),
+                num_heads=(3, 6, 12, 24),
+                strides = (2,2,2,2),
+                out_indices=(0, 1, 2, 3),
+                window_size=3,
+                more_output = more_output,
+        )
+
+        self.conv_change = ConvModule(
+                        vision_width,
+                        vision_width//8,
+                        1,
+                        stride=1,
+                        padding=0,
+                        conv_cfg=dict(type='Conv2d'),
+                        norm_cfg=dict(type='BN'))
+
+        self.layers = nn.ModuleList()
+        for i in range(3):
+            conv_module = ConvModule(
+                        feat_channel*2**(i),
+                        feat_channel*2**(i+1),
+                        3,
+                        stride=2,
+                        padding=1,
+                        conv_cfg=dict(type='Conv2d'),
+                        norm_cfg=dict(type='BN'))
+
+            self.layers.append(conv_module)
+            
+    def forward(self, image):
+        
+        image_embeds = self.visual_encoder(image)
+        identity = image_embeds
+        B, _, C = image_embeds.shape # torch.rand(1, 196, 768)
+        
+        cls_tokens = image_embeds[:,0,:]
+        cls_tokens = cls_tokens.view(B,-1,C)
+        
+        image_embeds = image_embeds[:,1:,:] # torch.rand(1, 197, 768)
+        B, L, C = image_embeds.shape # torch.rand(1, 196, 768)
+
+        img_size = (self.image_size,self.image_size)
+        patch_size = (16, 16)
+
+        h = math.ceil(img_size[0]/patch_size[0])
+        w = math.ceil(img_size[1]/patch_size[1])
+        assert h*w == L
+        hw_shape = (h, w)
+        image_embeds = image_embeds.view(-1, *hw_shape, C).permute(0, 3, 1, 2).contiguous() # (1, 768, 7, 7)
+        image_embeds = self.conv_change(image_embeds) # 96
+
+        inputs = []
+        x = image_embeds
+        inputs.append(x)
+        for i in range(len(self.layers)):
+            x = self.layers[i](x)
+            inputs.append(x)
+
+        image_embeds = self.swintransformer(inputs) # (B,L,C)
+        # print(len(image_embeds))
+        # print(image_embeds[0].shape)
+        # add first token
+        assert isinstance(image_embeds, tuple) and len(image_embeds) > 0
+        
+        # add into the first output
+        image_embeds_ = []
+        for i in range(len(image_embeds)):
+            if i>0:
+                image_embeds_.append(torch.cat((cls_tokens[:,:,:image_embeds[i].shape[-1]], image_embeds[i]), dim=1))
+            else:
+                image_embeds_.append(torch.cat((cls_tokens, image_embeds[i]), dim=1))
+                # print('layers with first {}'.format(image_embeds[i].shape))
+        image_embeds_.append(identity)
+        image_embeds = tuple(image_embeds_)
+        
+        return image_embeds
+
+
+def create_vit(vit, image_size, use_grad_checkpointing=False, ckpt_layer=0, drop_path_rate=0):
+    assert vit in ['base', 'large'], "vit parameter must be base or large"
+    if vit=='base':
+        vision_width = 768
+        visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=12, 
+                                           num_heads=12, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                           drop_path_rate=0 or drop_path_rate
+                                          )   
+    elif vit=='large':
+        vision_width = 1024
+        visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=24, 
+                                           num_heads=16, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                           drop_path_rate=0.1 or drop_path_rate
+                                          )
+        
+    return visual_encoder, vision_width
+
+
+
+class Create_Vit_Scale(nn.Module):
+    def __init__(self,vit, image_size, use_grad_checkpointing=False, ckpt_layer=0, drop_path_rate=0, 
+                 remain_depth_ratio = 1.0, more_output = False, use_scale_swin = False, use_scale_local = False, scale_emb = False, use_scale_vit = False, relative_pos = False, init_weights = False):
+        super(Create_Vit_Scale, self).__init__()
+        assert vit in ['scale', 'local', 'large'], "vit parameter must be base or large"
+        # 
+        self.image_size = image_size
+        self.more_output = more_output
+        if vit=='scale' or vit=='local':
+            if vit == 'scale':
+                use_scale_swin = True
+            elif vit == 'local':
+                use_scale_local = True
+                print('enable local vit, image_size {}'.format(image_size))
+                from .localvit import LocalTransformerScale
+            vision_width = 768
+            visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=12, 
+                                               num_heads=12, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                               drop_path_rate=0 or drop_path_rate
+                                               )
+        # shiyan large 1021                                     
+        elif vit=='large':
+            vision_width = 1024
+            visual_encoder = VisionTransformer(img_size=image_size, patch_size=16, embed_dim=vision_width, depth=24, 
+                                               num_heads=16, use_grad_checkpointing=use_grad_checkpointing, ckpt_layer=ckpt_layer,
+                                               drop_path_rate=0.1 or drop_path_rate
+                                              )
+            use_scale_swin = True
+        self.vision_width = vision_width
+        self.visual_encoder = visual_encoder
+        self.scale_emb = scale_emb
+        self.use_scale_vit = use_scale_vit
+        self.use_scale_swin = use_scale_swin
+        self.use_scale_local = use_scale_local
+        
+        self.relative_pos = relative_pos
+        # self.avg_pool = nn.AvgPool2d(4, stride=2) if image_size == 224 else nn.AvgPool2d(6, padding=1, stride=4)
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        # self.pos_embed = nn.Parameter(torch.zeros(1, 36, embed_dim))
+        if scale_emb:
+            self.scale_embedding = nn.Embedding(3, vision_width)
+        if use_scale_vit:
+            self.scale_size = int((image_size//16 - 4)//2 + 1) if image_size == 224 else int((image_size//16 - 4)//2 + 1)  # 6
+            self.pos_embedding = PositionalEmbedding2D(vision_width, tokens_shape = (4, 4), tokens_size = (self.scale_size, self.scale_size))
+            
+        if relative_pos:    
+            # mlp to generate continuous relative position bias
+            self.cpb_mlp = nn.Sequential(nn.Linear(2, 512, bias=True),
+                                       nn.ReLU(inplace=True),
+                                       nn.Linear(512, vision_width, bias=False))
+            
+            self.window_size = (6, 6)  # table size 36
+                
+    
+            # get relative_coords_table
+            relative_coords_h = torch.arange(-(self.window_size[0] - 1), self.window_size[0], dtype=torch.float32)
+            relative_coords_w = torch.arange(-(self.window_size[1] - 1), self.window_size[1], dtype=torch.float32)
+            relative_coords_table = torch.stack(
+                torch.meshgrid([relative_coords_h,
+                                relative_coords_w])).permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
+            
+            relative_coords_table[:, :, :, 0] /= (self.window_size[0] - 1)
+            relative_coords_table[:, :, :, 1] /= (self.window_size[1] - 1)
+            relative_coords_table *= 8  # normalize to -8, 8
+            relative_coords_table = torch.sign(relative_coords_table) * torch.log2(
+                torch.abs(relative_coords_table) + 1.0) / np.log2(8)
+    
+            self.register_buffer("relative_coords_table", relative_coords_table)
+            
+            # print('relative_coords_table {}'.format(relative_coords_table.shape))
+            
+            # get pair-wise relative position index for each token inside the window
+            coords_h = torch.arange(self.window_size[0])
+            coords_w = torch.arange(self.window_size[1])
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+            relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+            relative_coords[:, :, 1] += self.window_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+            
+            self.scale_size = int((image_size//16 - 4)//2 + 1) if image_size == 224 else int((image_size//16 + 2 - 6)//4 + 1)  # 6
+            self.index_scale = (int((self.window_size[0]*self.window_size[1] - self.scale_size)//2), int((self.window_size[0]*self.window_size[1] - self.scale_size)//2 + self.scale_size))
+            self.backbone_size = int(image_size//16)  # 14
+            self.index_backbone = (int((self.window_size[0]*self.window_size[1] - self.backbone_size)//2), int((self.window_size[0]*self.window_size[1] - self.backbone_size)//2 + self.backbone_size))
+            self.relative_position_index_scale = relative_position_index[self.index_scale[0]:self.index_scale[1],self.index_scale[0]:self.index_scale[1]]
+            self.relative_position_index_backbone = relative_position_index[self.index_backbone[0]:self.index_backbone[1],self.index_backbone[0]:self.index_backbone[1]]
+            # print('relative_position_index_scale shape {}, index_scale {}'.format(self.relative_position_index_scale.shape, self.index_scale))
+            # print('relative_position_index_backbone shape {}, index_backbone {}'.format(self.relative_position_index_backbone.shape, self.index_backbone))
+            self.register_buffer("relative_position_index", relative_position_index)
+            # print('relative_position_index_scale {}'.format(self.relative_position_index_scale))
+        
+        # final vit n layer for next cross attantion
+        # here set 1
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=vision_width, num_heads=24 if vit !='large' else 32, mlp_ratio=4, qkv_bias=True, qk_scale=None,
+                drop=0., attn_drop=0., drop_path=0., norm_layer=norm_layer,
+                use_grad_checkpointing=use_grad_checkpointing)
+            for i in range(1)])
+        print('final vit depth {}'.format(1))
+        
+        # first ver small vit 3 layer    
+        if use_scale_vit:
+            self.scale_vit = nn.Sequential(OrderedDict({'scale_vit{}'.format(i):
+                Block(
+                    dim=vision_width, num_heads=24, mlp_ratio=4, qkv_bias=True, qk_scale=None,
+                    drop=0., attn_drop=0., drop_path=0., norm_layer=norm_layer,
+                    use_grad_checkpointing=use_grad_checkpointing)
+                for i in range(3)}))
+                
+        if use_scale_swin:
+            window_size = 4 if image_size == 224 else 6
+            self.scale_swin = SwinTransformerScale(in_channels=vision_width,embed_dims=vision_width,
+            window_size=window_size, strides=(window_size,), num_heads=(24,) if vit!='large' else (32,))
+            print('use_scale_swin, window size {}'.format(window_size))
+        elif use_scale_local:
+            window_size = 4 if image_size == 224 else 6
+            padding_mask = False
+            print('use_scale_local, window size {}'.format(window_size))
+            print('enable padding mask {}'.format(padding_mask))
+            self.scale_local = LocalTransformerScale(img_size = image_size, window_size = window_size, padding_mask=padding_mask)
+            
+            
+        self.norm = norm_layer(vision_width)
+        
+        # init_weights
+        if init_weights:
+            self.init_weights()
+        
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                trunc_normal_init(m, std=.02, bias=0.)
+            elif isinstance(m, nn.LayerNorm):
+                constant_init(m, 1.0)
+            elif isinstance(m, nn.Conv2d):
+                trunc_normal_init(m, std=.02, bias=0.)
+        print('init_weights() in Create_Vit_Scale')
+        
+    def forward(self, image):
+        image_embeds = self.visual_encoder(image)
+        
+        B, _, C = image_embeds.shape # torch.rand(1, 197, 768)
+        
+        cls_tokens = image_embeds[:,0,:]
+        cls_tokens = cls_tokens.view(B,-1,C)
+        
+        image_embeds = image_embeds[:,1:,:] # torch.rand(1, 196, 768)
+        B, L, C = image_embeds.shape # torch.rand(1, 196, 768)
+
+        h = int(math.sqrt(L))
+        w = int(math.sqrt(L))
+        assert h*w == L
+        hw_shape = (h, w)
+        # image_embeds_scale = image_embeds.view(-1, *hw_shape, C).permute(0, 3, 1, 2).contiguous() # (1, 768, 14, 14)
+        # image_embeds_scale = self.avg_pool(image_embeds_scale)
+        # hw_scale = (image_embeds_scale.shape[-2], image_embeds_scale.shape[-1])
+        
+        if self.use_scale_swin:
+            assert self.use_scale_local is False
+            # if not self.scale_swin.window_attention_based:
+            image_embeds_scale = self.scale_swin(image_embeds, hw_shape)[0] # swin based window atention and PatchMerging
+            #     if self.scale_swin_base:
+            #         image_embeds = self.scale_swin_base(image_embeds, hw_shape)[0] # full window attention for image_embeds
+            # else:
+            #     #
+            #     assert self.scale_swin_base is None
+            #     image_embeds_scale, image_embeds = self.scale_swin(image_embeds, hw_shape)
+            #     # print('image_embeds.shape {}'.format(image_embeds.shape))
+            #     # print('image_embeds_scale.shape {}'.format(image_embeds_scale.shape))
+        if self.use_scale_local:
+            assert self.use_scale_swin is False
+            image_embeds_scale = self.scale_local(image_embeds) # local vit layer for scale
+        # print('image_embeds_scale {}'.format(image_embeds_scale.shape))
+        
+        if self.use_scale_vit:
+            # devide to (4, 4) tokens 36
+            image_embeds_scale = nn.Unfold(kernel_size=(4,4),dilation=1,padding=0,stride=2)(image_embeds_scale)
+        
+            tokens_nums = image_embeds_scale.shape[-1] # 36
+            image_embeds_scale = image_embeds_scale.view(B,C,4,4,-1) # ([2, 768, 4, 4, 36])
+            # add 2d sin cos
+            image_embeds_scale = image_embeds_scale + self.pos_embedding.pos2d_scale
+            image_embeds = image_embeds + self.pos_embedding.pos2d[:,:hw_shape[0],:hw_shape[1],:].contiguous().view(1, -1, C)
+            
+            # prepare new cls and each (4, 4) token as input for small vit
+            image_embeds_scale_list = [torch.cat((nn.Parameter(torch.zeros((1, 1, C), device=image_embeds_scale.device)).expand(B, -1, -1), image_embeds_scale[:,:,:,:,i].view(B, C,-1).permute(0, 2, 1)), dim = 1) for i in range(tokens_nums)]
+            # small vit new 36 cls tokens as scale tokens
+            image_embeds_scale_tokens = [self.scale_vit(image_embeds_scale_list[i])[:,0,:].view(B,-1,C) for i in range(len(image_embeds_scale_list))]
+            
+            image_embeds_scale = torch.cat(image_embeds_scale_tokens, dim = 1)
+            
+            image_embeds_scale = self.norm(image_embeds_scale.view(-1, tokens_nums, C)) # ([2, 36, 768])
+        
+        if self.relative_pos:
+            relative_position_bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.vision_width)
+            relative_position_bias_0 = relative_position_bias_table[self.relative_position_index_scale.contiguous().view(-1)].view(
+                self.scale_size, self.scale_size, -1)  # 6, 6, nH
+            
+            relative_position_bias_0 = 16 * torch.sigmoid(relative_position_bias_0)
+            # print('relative_position_bias_0 {}'.format(relative_position_bias_0.shape))
+            
+            relative_position_bias_1 = relative_position_bias_table[self.relative_position_index_backbone.contiguous().view(-1)].view(
+                hw_shape[0],hw_shape[1], -1)  # 14, 14, nH
+            
+            relative_position_bias_1 = 16 * torch.sigmoid(relative_position_bias_1)
+            # print('relative_position_bias_1 {}'.format(relative_position_bias_1.shape))
+            
+            image_embeds_scale = image_embeds_scale.view(-1, *hw_scale, C).contiguous() # (1, 6, 6, C)
+            image_embeds_scale = image_embeds_scale + relative_position_bias_0.unsqueeze(0)
+            image_embeds = image_embeds.view(-1, *hw_shape, C).contiguous() + relative_position_bias_1.unsqueeze(0)
+            
+            image_embeds_scale = image_embeds_scale.view(-1, hw_scale[0]*hw_scale[1], C)
+            image_embeds = image_embeds.view(-1, L, C)
+            
+        
+        # same with 0907
+        x = torch.cat((cls_tokens, image_embeds_scale, image_embeds), dim=1) # 
+        
+        if self.scale_emb:
+            token_type_ids_0 = torch.zeros((B, 1), dtype=torch.long, device=cls_tokens.device)
+            token_type_ids_1 = torch.ones(image_embeds_scale.shape[:-1], dtype=torch.long, device=image_embeds_scale.device)
+            token_type_ids_2 = torch.full(image_embeds.shape[:-1], 2, dtype=torch.long, device=image_embeds.device)
+            token_type_ids = torch.cat((token_type_ids_0,token_type_ids_1,token_type_ids_2), dim = 1)
+            
+            scale_emb = self.scale_embedding(token_type_ids)
+            
+            
+            
+        # final vit one layer for next cross attantion
+        
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+        x = self.norm(x)
+        
+        # if self.scale_emb:
+        #     x = x + scale_emb
+        
+        return x
+
+def is_url(url_or_filename):
+    parsed = urlparse(url_or_filename)
+    return parsed.scheme in ("http", "https")
+
+#
+def set_freeze_by_names(model, layer_names, freeze=True):
+    assert isinstance(layer_names, list)
+    # print(layer_names)
+    for name, child in model.named_modules():
+        if name in layer_names:
+            for param in child.parameters():
+                param.requires_grad = not freeze
+                # print('name: {}, grad" {}'.format(name, param.requires_grad))
+
+def load_checkpoint(model,url_or_filename, freeze_layers_num = 0):
+    if is_url(url_or_filename):
+        cached_file = download_cached_file(url_or_filename, check_hash=False, progress=True)
+        checkpoint = torch.load(cached_file, map_location='cpu') 
+    elif os.path.isfile(url_or_filename):        
+        checkpoint = torch.load(url_or_filename, map_location='cpu') 
+    else:
+        raise RuntimeError('checkpoint url or path is invalid')
+        
+    state_dict = checkpoint['model']
+    
+    if model.use_swin:
+        # state_dict = change_checkpoint(model, state_dict)
+    
+        state_dict['visual_encoder.visual_encoder.pos_embed'] = interpolate_pos_embed(state_dict['visual_encoder.visual_encoder.pos_embed'],model.visual_encoder.visual_encoder) 
+        if 'visual_encoder.visual_encoder_m.pos_embed' in model.state_dict().keys():
+            state_dict['visual_encoder.visual_encoder_m.pos_embed'] = interpolate_pos_embed(state_dict['visual_encoder.visual_encoder_m.pos_embed'],
+                                                                             model.visual_encoder.visual_encoder_m)
+     
+    else:
+        state_dict['visual_encoder.pos_embed'] = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder) 
+        if 'visual_encoder_m.pos_embed' in model.state_dict().keys():
+            state_dict['visual_encoder_m.pos_embed'] = interpolate_pos_embed(state_dict['visual_encoder_m.pos_embed'],
+                                                                             model.visual_encoder_m) 
+    
+    # change ckpt reshape 1009
+    relative_position_bias_table_keys = [
+                k for k in state_dict.keys()
+                if 'relative_position_bias_table' in k and k.startswith('visual_encoder.')
+            ]
+    # print('state_dict {}'.format(relative_position_bias_table_keys))
+             
+    for table_key in relative_position_bias_table_keys:
+        table_pretrained = state_dict[table_key]
+        table_current = model.state_dict()[table_key]
+        L1, nH1 = table_pretrained.size()
+        L2, nH2 = table_current.size()
+        if nH1 != nH2:
+            logger.warning(f'Error in loading {table_key}, pass')
+        elif L1 != L2:
+            S1 = int(L1**0.5)
+            S2 = int(L2**0.5)
+            table_pretrained_resized = F.interpolate(
+                table_pretrained.permute(1, 0).reshape(1, nH1, S1, S1),
+                size=(S2, S2),
+                mode='bicubic')
+            state_dict[table_key] = table_pretrained_resized.view(
+                nH2, L2).permute(1, 0).contiguous()
+            print('pretrained.size {}, current.size {}'.format(S1, S2))
+    
+    # print('state_dict {}'.format(list(state_dict.keys())[10:]))
+    # print('model dict {}'.format(list(model.state_dict().keys())[:10]))
+    
+    for key in model.state_dict().keys():
+        if key in state_dict.keys():
+            if state_dict[key].shape!=model.state_dict()[key].shape:
+                del state_dict[key]
+    
+    msg = model.load_state_dict(state_dict,strict=False)
+    
+    if freeze_layers_num > 0:
+        # for key in model.state_dict().keys():
+        #     print('model keys: {}'.format(key))
+        freeze_layers = ['visual_encoder.patch_embed',]
+        for i in range(freeze_layers_num):
+            freeze_layers.append('visual_encoder.blocks.{}'.format(i))
+            
+        if model.use_swin:
+            freeze_layers = ['visual_encoder.'+item for item in freeze_layers]
+
+        set_freeze_by_names(model, freeze_layers)
+
+    print('load checkpoint from %s'%url_or_filename)  
+    return model,msg
+    
+    
+def load_scale_pretrained(model, scale_pretrained = ''):
+    # load pretrained with scale in pretraining checkpoint
+    checkpoint = torch.load(scale_pretrained, map_location='cpu') 
+    state_dict = checkpoint["model"]
+    for k in list(state_dict.keys()):
+        if k.startswith('text_encoder.'):
+            state_dict[k.replace('text_encoder.','')] = state_dict[k]
+        del state_dict[k]
+    # print('remain keys :{}'.format(len(state_dict.keys())))
+    msg = model.text_encoder.load_state_dict(state_dict,strict=False)
+    # print('text_encoder loadded from {}, missing keys {}'.format(scale_pretrained, len(msg.missing_keys)))
+    return model, msg
+    
+
+def change_checkpoint(model, state_dict):
+    temp = OrderedDict()
+    for k in state_dict:
+        k2 = k.replace('visual_encoder.', 'visual_encoder.visual_encoder.') if k.startswith('visual_encoder.') else k
+        # k2 = k2.strip()
+        temp[k2] = state_dict[k]
+    return temp
+    
+
+
+            
