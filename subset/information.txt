@@ -1,0 +1,11 @@
+--2026-02-04 17:19:33-- https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_test.json Resolving storage.googleapis.com (storage.googleapis.com)... 74.125.135.207, 142.251.188.207, 192.178.163.207, ... Connecting to storage.googleapis.com (storage.googleapis.com)|74.125.135.207|:443... connected. HTTP request sent, awaiting response... 200 OK Length: 1735468 (1.7M) [application/json] Saving to: ‘coco_karpathy_test.json’
+
+coco_karpathy_test. 100%[===================>] 1.65M --.-KB/s in 0.02s
+
+2026-02-04 17:19:33 (95.2 MB/s) - ‘coco_karpathy_test.json’ saved [1735468/1735468]
+
+big_images_view: 200 from 341
+{'dining table': 73, 'person': 35, 'bed': 12, 'bowl': 6, 'oven': 6, 'car': 6, 'refrigerator': 6, 'pizza': 5, 'chair': 5, 'couch': 5, 'train': 5, 'bench': 4, 'suitcase': 3, 'potted plant': 3, 'truck': 3, 'laptop': 3, 'bird': 2, 'boat': 2, 'cat': 2, 'elephant': 2, 'keyboard': 2, 'dog': 2, 'cake': 2, 'orange': 1, 'airplane': 1, 'book': 1, 'giraffe': 1, 'tennis racket': 1, 'parking meter': 1, 'umbrella': 1, 'donut': 1, 'bus': 1, 'toilet': 1} 
+
+all_images_view: 5000
+{'person': 2627, 'chair': 545, 'car': 522, 'dining table': 517, 'cup': 382, 'bottle': 369, 'handbag': 288, 'bowl': 286, 'truck': 273, 'book': 247, 'bench': 232, 'clock': 213, 'backpack': 212, 'sink': 205, 'cell phone': 199, 'traffic light': 192, 'cat': 192, 'dog': 183, 'knife': 182, 'couch': 175, 'sports ball': 170, 'potted plant': 167, 'tv': 167, 'umbrella': 165, 'tie': 161, 'spoon': 161, 'toilet': 159, 'surfboard': 156, 'laptop': 150, 'bus': 148, 'bed': 148, 'motorcycle': 148, 'train': 146, 'fork': 143, 'skateboard': 143, 'boat': 139, 'bird': 131, 'pizza': 131, 'cake': 128, 'wine glass': 128, 'tennis racket': 127, 'bicycle': 126, 'remote': 125, 'vase': 120, 'skis': 118, 'horse': 118, 'giraffe': 113, 'airplane': 113, 'baseball glove': 110, 'suitcase': 110, 'oven': 108, 'sandwich': 106, 'baseball bat': 98, 'refrigerator': 94, 'elephant': 93, 'teddy bear': 89, 'kite': 87, 'frisbee': 85, 'keyboard': 85, 'cow': 84, 'mouse': 82, 'banana': 80, 'zebra': 78, 'donut': 77, 'fire hydrant': 77, 'broccoli': 75, 'stop sign': 75, 'carrot': 75, 'orange': 74, 'sheep': 73, 'apple': 69, 'snowboard': 65, 'microwave': 54, 'hot dog': 51, 'scissors': 43, 'toothbrush': 43, 'parking meter': 37, 'bear': 29, 'toaster': 11, 'hair drier': 9}
